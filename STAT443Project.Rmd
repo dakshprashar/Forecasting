@@ -1,0 +1,314 @@
+---
+title: "443 project"
+output: pdf_document
+date: "2024-11-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Problem
+
+The idea of the project is to analyse the earnings dataset and fit a model to it to explore trends in earnings as well as predict the median earnings for the next year. This is particularly important now as a lot of us are graduating within the next year and are searching for full-time jobs. 
+
+## Data
+
+As concluded from the description of the dataset, this data contains quarterly, seasonally adjusted data on the median weekly earnings.  
+
+The data was collected by surveying the participants. Note that self-employed individuals were not considered for this survey. As indicated in the data description, there was a change in a data collection method in 1994. Prior to 1994, the participants were asked to provide their weekly income while after January 1994 they were asked to provide this information in a way that is easiest for them and that was later converted to weekly earnings. In both cases, the values in the dataset are weekly median earnings ordered by quarters. 
+
+Some of the things we needed to keep in mind when working with this dataset:
+
+1. The data is quarterly rather than monthly
+2. As provided in the data description, there was a change in the data collection process around 1994 which is the definition of a change point. this might make the patterns in the data more complex.
+3. Since the data was collected through surveying, it likely contains biased and should be taken with a grain of salt. 
+4. There might be a change point around 2020 caused by covid that is not included in the data description
+
+As a note: the data does not contain any missing values so we did not have to address this issue 
+
+
+```{r, echo=FALSE}
+data <- ts(read.csv("LES1252881600Q.csv")["LES1252881600Q"], start = 1979, frequency = 4)
+```
+
+## Plan
+
+The goal of this project is to create a model that can be used to predict the earnings in the upcoming year. For that, we will need to go through the following steps
+
+1. Identify any sources of non-stationarity in the dataset.
+2. If the data doesn't have constant variance, use Box-Cox transformation to address the issue.
+3. If the trend and/or seasonality are present, test out appropriate models that.
+4. Using APSE, select the model with the highest prediction power.
+5. Fit the model from step 4 on the whole dataset and predict the upcoming year.
+
+## Exploratory data analysis 
+
+The first step is to plot the whole dataset. 
+
+```{r, echo=FALSE}
+plot(data, xlab = "Time", ylab = "Median weekly earnings", main = "Median weekly earnings")
+abline(v = 1994, col = "red", lty = "dashed")
+abline(v = 2020 + 3/12, col = "blue", lty = "dashed")
+legend("topleft", legend=c("Data", "Changes in data collection", "COVID change point"), 
+       col=c("black", "red", "blue"), lty=c(1, 2, 2), cex=0.7)
+
+```
+
+The first thing we notice is that Covid indeed had an impact on the data. There seem to be a sharp increase in the median weekly earnings right around that period which might affect our future analysis.
+
+At a first glance, the data does not contain a seasonal component but it does seem to have an upward trend. There also does seem to be some changes in variance. We verify this using Fligner-Killeen test for constant variance. 
+
+```{r, echo=FALSE}
+library(stats)
+groups <- as.factor(c(rep(c(1:14), each = length(data) / 14), 14))
+fligner.test(as.numeric(data), groups) 
+```
+
+A low p-value indicates that there is strong evidence against the null hypothesis of normal variance. This will be addressed later.
+
+Investigating the ACF plot we see further evidence that this data does not have a seasonal component. This is expected as the data has been seasonally adjusted. However, we do see a slow (not exponential) drop in the ACF spikes. This provides more reason to believe that this data has a trend and is not stationary.
+
+```{r, echo=FALSE}
+acf(data, main = "ACF")
+```
+```{r, echo=FALSE}
+pacf(data, main = "PACF")
+```
+
+Taking a look at the differenced data, starting with lag 1, we get the following ACF plot
+
+```{r, echo=FALSE}
+acf(diff(data), main = "ACF")
+```
+
+Generally there does not appear to be correlation in the differenced data with a few false positives around lag 2 and 3.75. This plot suggests that all of the information about the data is provided in the trend. 
+
+## Variance stabilization
+
+The first step is to stabilize variance using a Box-Cox tranformation
+
+```{r, echo=FALSE}
+library(MASS)
+bx_model <- boxcox(as.numeric(data) ~ 1, lambda = seq(-15, 5, length=100))
+opt_lambda <- bx_model$x[which.max(bx_model$y)]
+# plot(data, ylab = "Yt",  main = "Time series plot of \n original data")
+transformed = (data)^opt_lambda
+```
+Performing the Fligner Killeen test on the transformed data, we see that a very small p-value of `3.86e-05` indicates that the variance cannot be made constant using this type of transformation. 
+```{r, echo=FALSE}
+groups <- as.factor(c(rep(c(1:14), each = length(data) / 14), 14))
+fligner.test(as.numeric(transformed), groups) 
+```
+We will proceed the work using untransformed data.
+
+### Trend estimation
+
+In this step we will consider multiple models like exponential smoothing, double exponential smoothing, linear regression (with multiple polynomial degrees), and Box-Jenkins models and compare them based on their prediction power. We will also asses whether the residuals are stationary or not and combine models if necessary.
+
+With this dataset, the last $10\%$ of the observations were part of the test set and everything else is in the training set. 
+```{r, echo=FALSE}
+train <- window(data, end = 2019+3/4)
+test <- window(data, start = 2020)
+```
+
+1. SARIMA model
+
+```{r}
+sarima(data, 1, 1, 0)
+```
+
+1. Simple linear regression
+
+```{r, echo = FALSE}
+set.seed(12)
+
+poly.Time = poly(as.vector(time(data)), 15)
+train_data_df = data.frame(Earnings = as.numeric(train), head(poly.Time, -19))
+test_data_df = data.frame(Earnings = as.numeric(test), tail(poly.Time, 19))
+
+X_train = as.matrix(train_data_df[, 2, drop = FALSE])
+X_test = as.matrix(test_data_df[, 2, drop = FALSE])
+lm_model = lm(train_data_df$Earnings ~ X_train)
+
+b = lm_model$coefficients["(Intercept)"]
+m = lm_model$coefficients["X_train"]
+
+predictions = c()
+for (x_val in X_test) {
+  pred = m * x_val + b
+  predictions = c(predictions, pred)
+}
+
+APSE_deg1 = mean((predictions - test_data_df$Earnings)^2)
+print(APSE_deg1)
+```
+1. Exponential smoothing
+    This type of a model predicts in a straight line, strictly based on the last observation
+```{r, echo = FALSE}
+plot(train, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2025), 
+     ylim = c(305,395),
+     col = "blue", type = "p")
+points(test, col = "red")
+legend('topleft', legend=c("Training set", "Test set", "Fit", 
+                          "Year-ahead prediction"), 
+       col=c("blue", "red", "blue", "red"), 
+       lty=c(NA, NA, 1,1), pch = c(1, 1, NA, NA), cex=1)
+model = HoltWinters(train, gamma = FALSE , beta = FALSE) 
+es.train = model$fitted
+HW.predict = predict(model, n.ahead=20 , prediction.interval = TRUE , level=0.95)
+lines(ts(start = 1979 + 1/4, es.train[1:(length(train) - 1)], frequency = 4), 
+      col = adjustcolor('blue', 0.7), lwd = 2)
+lines(ts(start = 2020 + 1/4, HW.predict[,"fit"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+APSE = mean((test - HW.predict[,"fit"])^2)
+APSE
+```
+
+2. Double exponential smoothing
+    This type of a model predicts in a straight line, strictly based on the last observation
+```{r, echo = FALSE}
+plot(train, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2025), 
+     ylim = c(305,395),
+     col = "blue", type = "p")
+points(test, col = "red")
+legend('topleft', legend=c("Training set", "Test set", "Fit", 
+                          "Year-ahead prediction"), 
+       col=c("blue", "red", "blue", "red"), 
+       lty=c(NA, NA, 1,1), pch = c(1, 1, NA, NA), cex=1)
+model = HoltWinters(train, gamma = FALSE) 
+es.train = model$fitted
+HW.predict = predict(model, n.ahead=20 , prediction.interval = TRUE , level=0.95)
+lines(ts(start = 1979 + 2/4, es.train[,"xhat"], frequency = 4), 
+      col = adjustcolor('blue', 0.7), lwd = 2)
+lines(ts(start = 2020 + 1/4, HW.predict[,"fit"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+APSE = mean((test - HW.predict[,"fit"])^2)
+APSE
+```
+
+Compared to the regular exponential smoothing, double exponential smoothing has a lower APSE. In part because it is able to capture more 
+In this step 
+
+3. Elastic net regression with various polynomial degrees and various $\alpha$ values
+```{r, echo = FALSE}
+library(glmnet)
+set.seed(12)
+
+alpha_values = c(0, 0.5, 1)
+Log.Lambda.Seq = c(seq(-15, -0.5, by = 0.1), seq(0, 10, by = 0.1))
+Lambda.Seq = exp(Log.Lambda.Seq)
+
+APSE_df = data.frame(alpha = numeric(), degree = integer(), APSE = numeric())
+
+for (a in alpha_values) {
+  for (deg in 2:15) {
+    X_train = as.matrix(train_data_df[2:(deg + 1)])
+    Y_train = train_data_df$Earnings
+    CV = cv.glmnet(x = X_train, y = Y_train, alpha = a, lambda = Lambda.Seq, nfolds = 10)
+    lambda_1se = CV$lambda.1se
+    model = glmnet(x = X_train, y = Y_train, alpha = a, lambda = lambda_1se)
+    predictions = predict(model, newx = as.matrix(test_data_df[, 2:(deg + 1)]))
+    APSE = mean((predictions - test_data_df$Earnings)^2)
+    APSE_df = rbind(APSE_df, data.frame(alpha = a, degree = deg, APSE = APSE))
+  }
+}
+
+par(mfrow = c(1, 3), mar = c(10, 1, 10, 1))
+
+plot(APSE_df$degree[APSE_df$alpha == alpha_values[1]], APSE_df$APSE[APSE_df$alpha == alpha_values[1]], 
+  type = "o", col = "blue", pch = 16, xlab = "Polynomial Degree", ylab = "APSE",
+  main = "APSE vs Polynomial Degree\n for Alpha = 0")
+
+plot(APSE_df$degree[APSE_df$alpha == alpha_values[2]], APSE_df$APSE[APSE_df$alpha == alpha_values[2]], 
+  type = "o", col = "blue", pch = 16, xlab = "Polynomial Degree", ylab = "APSE",
+  main = "APSE vs Polynomial Degree\n for Alpha = 0.5")
+
+plot(APSE_df$degree[APSE_df$alpha == alpha_values[3]], APSE_df$APSE[APSE_df$alpha == alpha_values[3]], 
+  type = "o", col = "blue", pch = 16, xlab = "Polynomial Degree", ylab = "APSE",
+  main = "APSE vs Polynomial Degree\n for Alpha = 1")
+```
+
+```{r}
+set.seed(12)
+observed = test_data_df$Earnings
+X_train = as.matrix(train_data_df[, 2:6])
+Y_train = train_data_df$Earnings
+X_test = as.matrix(test_data_df[, 2:6])
+
+
+CV1 = cv.glmnet(x = X_train, y = Y_train, alpha = 0, lambda = Lambda.Seq, nfolds = 10)
+lambda_1se1 = CV1$lambda.1se
+print(lambda_1se1)
+best_model_1 = glmnet(x = X_train, y = Y_train, alpha = 0, lambda = lambda_1se1)
+fitted_values1 = predict(best_model_1, newx = X_test)
+
+CV2 = cv.glmnet(x = X_train, y = Y_train, alpha = 0.5, lambda = Lambda.Seq, nfolds = 10)
+lambda_1se2 = CV2$lambda.1se
+print(lambda_1se2)
+best_model_2 = glmnet(x = X_train, y = Y_train, alpha = 0.5, lambda = lambda_1se2)
+fitted_values2 = predict(best_model_2, newx = X_test)
+
+CV3 = cv.glmnet(x = X_train, y = Y_train, alpha = 1, lambda = Lambda.Seq, nfolds = 10)
+lambda_1se3 = CV3$lambda.1se
+print(lambda_1se3)
+best_model_3 = glmnet(x = X_train, y = Y_train, alpha = 1, lambda = lambda_1se3)
+fitted_values3 = predict(best_model_3, newx = X_test)
+
+
+APSE1 = mean((observed - fitted_values1)^2)
+APSE2 = mean((observed - fitted_values2)^2)
+APSE3 = mean((observed - fitted_values3)^2)
+acf((observed - fitted_values1), main = "ACF1")
+acf((observed - fitted_values2), main = "ACF2")
+acf((observed - fitted_values3), main = "ACF3")
+
+
+
+pacf((observed - fitted_values1), main = "PACF1")
+pacf((observed - fitted_values2), main = "PACF2")
+pacf((observed - fitted_values3), main = "PACF3")
+table = data.frame(
+  Alpha = alpha_values,
+  APSE = c(APSE1,APSE2,APSE3)
+)
+print(table)
+```
+
+## Prediction
+
+For this section we will be working with double exponential smoothing model since that was the model that reported the lowest APSE value. Here, we will fit the model on the whole dataset and then predict
+
+```{r, echo = FALSE}
+plot(data, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2027), 
+     ylim = c(305,395),
+     col = "blue", type = "p")
+legend('topleft', legend=c("Training set", "Test set", "Fit", 
+                          "Year-ahead prediction"), 
+       col=c("blue", "red", "blue", "red"), 
+       lty=c(NA, NA, 1,1), pch = c(1, 1, NA, NA), cex=1)
+model = HoltWinters(data, beta = TRUE, gamma = FALSE) 
+es.train = model$fitted
+HW.predict = predict(model, n.ahead=8 , prediction.interval = TRUE , level=0.95)
+lines(ts(start = 1979 + 2/4, es.train[,"xhat"], frequency = 4), 
+      col = adjustcolor('blue', 0.7), lwd = 2)
+lines(ts(start = 2025 + 1/4, HW.predict[,"fit"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+```
+
+
+## Conclusions
+
+1. Effects of the change point
+2. Starionarity of the residuls on the full data
+3. 
+
+
+Take this with a grain of salt. since the chnge point was so recent, we can't 
+
