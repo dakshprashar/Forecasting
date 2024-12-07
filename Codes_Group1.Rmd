@@ -1,0 +1,668 @@
+---
+title: "Forecast of Weekly Median Household Earnings in the US"
+author:
+  - Daksh Prashar
+  - Dhruv Tantia
+  - Laura Edward
+  - Sofya Malashchenko
+output:
+  pdf_document:
+    extra_dependencies: ["float"]
+date: "2024-12-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(glmnet)
+```
+
+## Problem
+
+The idea of the project is to analyse the earnings dataset and fit a model to it to explore trends in earnings as well as predict the median earnings for the next year. This is particularly important now as a lot of us are graduating within the next year and are searching for full-time jobs. 
+
+## Plan
+
+The goal of this project is to create a model that can be used to predict the earnings in the upcoming year. For that, we will need to go through the following steps
+
+1. Identify any sources of non-stationarity in the dataset.
+2. If the data doesn't have constant variance, use Box-Cox transformation to address the issue.
+3. If the trend and/or seasonality are present, test out appropriate models that.
+4. Using APSE, select the model with the highest prediction power.
+5. Fit the model from step 4 on the whole dataset and predict the upcoming year.
+
+
+## Data
+
+As concluded from the description of the dataset, this data contains quarterly, seasonally adjusted data on the median weekly earnings.  
+
+The data was collected by surveying the participants. Note that self-employed individuals were not considered for this survey. As indicated in the data description, there was a change in a data collection method in 1994. Prior to 1994, the participants were asked to provide their weekly income while after January 1994 they were asked to provide this information in a way that is easiest for them and that was later converted to weekly earnings. In both cases, the values in the dataset are weekly median earnings ordered by quarters. 
+
+Some of the things we needed to keep in mind when working with this dataset:
+
+1. The data is quarterly rather than monthly
+2. As provided in the data description, there was a change in the data collection process around 1994 which is the definition of a change point. this might make the patterns in the data more complex.
+3. Since the data was collected through surveying, it likely contains biased and should be taken with a grain of salt. 
+4. There might be a change point around 2020 caused by covid that is not included in the data description
+
+As a note: the data does not contain any missing values so we did not have to address this issue 
+
+
+```{r, echo=FALSE}
+original_data <- ts(read.csv("LES1252881600Q.csv")["LES1252881600Q"], start = 1979, frequency = 4)
+```
+
+## Exploratory data analysis 
+
+The first step is to plot the whole dataset. 
+\newpage
+
+```{r, echo=FALSE, fig.align="center", out.width="80%", fig.cap="Plot of the full earnings dataset"}
+plot(original_data, xlab = "Time", ylab = "Median weekly earnings", main = "Median weekly earnings")
+
+abline(v = 1994, col = "red", lty = "dashed")
+abline(v = 2020 + 3/12, col = "blue", lty = "dashed")
+legend("topleft", legend=c("Data", "Changes in data collection", "COVID change point"), 
+       col=c("black", "red", "blue"), lty=c(1, 2, 2), cex=0.7)
+```
+```{r, echo=FALSE}
+time_index <- time(original_data)
+data_without_2020 <- original_data[time_index < 2020 | time_index >= 2021]
+# Create a new time series without 2020 and shifted up
+no_2020_data <- ts(data_without_2020, start = 1979, frequency = 4)
+data = no_2020_data
+```
+
+
+Looking at Figure 1, the first thing we notice is that Covid indeed had an impact on the data. There seem to be a sharp increase in the median weekly earnings right around that period which might affect our future analysis. Hence, it was decided to remove this period from the dataset. That is, we removed all of $2020$ from our data (see Figure 2 for a visual). For the rest of the report we will be working with this dataset.
+
+```{r, echo=FALSE, fig.align= "center", out.width="80%", fig.cap="Plot of earnings data with 2020 removed", fig.pos = "H"}
+plot(data, xlab = "Time", ylab = "Median weekly earnings without 2020", main = "Median weekly earnings without 2020")
+```
+
+At a first glance, the data does not contain a seasonal component but it does seem to have an upward trend. There also does seem to be some changes in variance. We verify this using Fligner-Killeen test for constant variance. After running the test, a p-value of `6.138e-06` was observed which indicates that there is strong evidence against the null hypothesis of normal variance. This will be addressed later.
+
+```{r, echo=FALSE, results='hide'}
+library(stats)
+groups <- as.factor(c(rep(c(1:14), each = length(data) / 14), rep(15, 11)))
+fligner.test(as.numeric(data), groups) 
+```
+
+The next step is to take a look at the ACF plot of the whole dataset to see if there are trend and/or seasonality components in the data. Investigating the ACF plot in Figure 3, we see further evidence that this data does not have a seasonal component. This is expected as the data has been seasonally adjusted. However, we do see a slow (not exponential) drop in the ACF spikes. This provides more reason to believe that this data has a trend and is not stationary. As it can be seen from the ACF plot in Figure 3, there seems to be a slow linear decay in the spikes, thus, we can conclude that the process is not stationary as a trend exists.
+
+```{r, echo=FALSE, out.width="50%", fig.cap="ACF plot of the whole dataset", fig.align='center', fig.pos = "H"}
+acf(data, main = "ACF")
+```
+
+For more context on the underlying process in this data, we take a look at the PACF plot. On the PACF plot in Figure 4, we can see that there is a spike at lag 1, which leads us to believe that this might be an AR(1) process. We will investigate and confirm this in the following sections.
+
+```{r, echo=FALSE, out.width="50%", fig.cap="PACF plot of the whole dataset", fig.pos = "!h",fig.align='center'}
+pacf(data, main = "PACF")
+```
+
+Note that since there is a decreasing trend in the ACF plot, we likely have a trend in the data. Hence, we will see if first-order differencing can remove this trend. Taking a look at the differenced data, we get the following ACF plot.
+
+```{r, echo=FALSE, fig.align= "center", out.width="65%", fig.cap="ACF plot of differenced data", fig.pos = "H"}
+acf(diff(data), main = "ACF of Differeced Data at Lag 1")
+```
+
+Generally there does not appear to be correlation in the differenced data with a few false positives around lag 8 and lag 15. This plot in Figure 5 suggests that all of the information about the data is provided in the trend. 
+
+## Variance stabilization
+
+Earlier we noticed that the variance in the dataset is not constant. To remove this source of non-stationarity we will attempt to stabilize the variance using a Box-Cox transformation. Running the `boxcox` model suggest an optimal lambda value of $-6.111111$. However, performing the Fligner Killeen test on the transformed data, we get a p-value of `1.27e-06`. This indicates that the variance cannot be made constant using this type of transformation. Thus, for the rest of the report we will proceed with the untransformed data.
+
+```{r, echo=FALSE, fig.show='hide'}
+library(MASS)
+bx_model <- boxcox(as.numeric(data) ~ 1, lambda = seq(-15, 5, length=100))
+opt_lambda <- bx_model$x[which.max(bx_model$y)]
+transformed = (data)^opt_lambda
+```
+
+
+```{r, echo=FALSE, results='hide'}
+groups <-as.factor(c(rep(c(1:14), each = length(data) / 14), rep(15, 11)))
+fligner.test(as.numeric(transformed), groups) 
+```
+
+
+## Trend estimation
+
+In this step we will consider multiple models like simple linear regression, exponential smoothing, double-exponential smoothing, elastic net regression (with multiple orthogonal polynomial degrees), and Box-Jenkins models and compare them based on their prediction power or APSE. We will also asses whether the residuals are stationary or not and combine models if necessary.
+
+With this dataset, approximately the last $10\%$ of the observations were part of the test set and everything prior is in the training set.
+
+```{r, echo=FALSE}
+train <- window(data, end = 2019+3/4)
+test <- window(data, start = 2020)
+```
+
+
+**1. Simple linear regression**
+
+Here, we fit a simple linear regression model with polynomial degree $p = 1$. 
+
+```{r, echo=FALSE, fig.align= "center", out.width="70%", fig.cap="Plot of the data with linear regression model", fig.pos = "H"}
+set.seed(12)
+
+model_APSEs = c()
+
+poly.Time = poly(as.vector(time(data)), 15)
+train_data_df = data.frame(Earnings = as.numeric(train), head(poly.Time, -15))
+test_data_df = data.frame(Earnings = as.numeric(test), tail(poly.Time, 15))
+
+X_train = as.matrix(train_data_df[, 2, drop = FALSE])
+X_test = as.matrix(test_data_df[, 2, drop = FALSE])
+lm_model = lm(train_data_df$Earnings ~ X_train)
+fit = predict(lm_model, time(data))
+
+b = lm_model$coefficients["(Intercept)"]
+m = lm_model$coefficients["X_train"]
+
+predictions = c()
+for (x_val in X_test) {
+  pred = m * x_val + b
+  predictions = c(predictions, pred)
+}
+
+APSE_deg1 = mean((predictions - test_data_df$Earnings)^2)
+plot(train, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2025), 
+     ylim = c(305,395),
+     col = "blue", type = "p")
+legend('topleft', legend=c("Training set", "Test set", "Fit", 
+                          "Year-ahead prediction"), 
+       col=c("blue", "red", "blue", "red"), 
+       lty=c(NA, NA, 1,1), pch = c(1, 1, NA, NA), cex=1)
+points(test, col = "red")
+lines(ts(start = 2020, predictions, frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+lines(ts(start = 1979, fit, frequency = 4), 
+      col = adjustcolor('blue', 0.7), lwd = 2)
+```
+
+The APSE value for the linear model in figure 6 is `326.5539`. Looking at the plot we notice that the model doesn't seem to capture the full trend. In particular, from around 2013 to 2020 the trend is very underestimated. Hence, this will likely not be the final model as it doesn't perform well with the given data.
+
+**2. Exponential smoothing**
+
+Now we will see if regular exponential smoothing is a good fit for this dataset. 
+
+```{r, echo=FALSE, fig.align= "center", out.width="70%", fig.cap="Plot of the data with exponential smoothing model", fig.pos = "H"}
+plot(train, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2025), 
+     ylim = c(305,395),
+     col = "blue", type = "p")
+points(test, col = "red")
+legend('topleft', legend=c("Training set", "Test set", "Fit", 
+                          "Year-ahead prediction"), 
+       col=c("blue", "red", "blue", "red"), 
+       lty=c(NA, NA, 1,1), pch = c(1, 1, NA, NA), cex=1)
+model = HoltWinters(train, gamma = FALSE , beta = FALSE) 
+es.train = model$fitted
+HW.predict = predict(model, n.ahead=15 , prediction.interval = TRUE , level=0.95)
+lines(ts(start = 1979 + 1/4, es.train[1:(length(train) - 1)], frequency = 4), 
+      col = adjustcolor('blue', 0.7), lwd = 2)
+lines(ts(start = 2020 + 1/4, HW.predict[,"fit"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+APSE_exp = mean((test - HW.predict[,"fit"])^2)
+```
+
+As we can see the exponential smoothing model seems to fit the training data well, however, the prediction based on the model is not performing as we hoped as it is simply a straight horizontal line.
+
+
+**3. Double exponential smoothing**
+Next, we apply the double exponential smoothing. This type of a model predicts in a straight line, strictly based on the last observation.
+```{r, echo=FALSE, fig.align= "center", out.width="70%", fig.cap="Plot of the data with double exponential smoothing model", fig.pos = "H"}
+plot(train, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2025), 
+     ylim = c(305,395),
+     col = "blue", type = "p")
+points(test, col = "red")
+legend('topleft', legend=c("Training set", "Test set", "Fit", 
+                          "Year-ahead prediction"), 
+       col=c("blue", "red", "blue", "red"), 
+       lty=c(NA, NA, 1,1), pch = c(1, 1, NA, NA), cex=1)
+model = HoltWinters(train, gamma = FALSE) 
+es.train = model$fitted
+HW.predict = predict(model, n.ahead=15 , prediction.interval = TRUE , level=0.95)
+lines(ts(start = 1979 + 2/4, es.train[,"xhat"], frequency = 4), 
+      col = adjustcolor('blue', 0.7), lwd = 2)
+lines(ts(start = 2020 + 1/4, HW.predict[,"fit"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+APSE_dbl_exp = mean((test - HW.predict[,"fit"])^2)
+```
+
+Similiar to the exponential smoothing, the double-exponential smoothing model also seems to fit the training data well, however, the prediction based on the double exponential model seems to be able to capture the trend of our test set.
+
+
+**4. Elastic net regression with various orthogonal polynomial degrees and various $\alpha$ values**
+
+We aim to fit a model using orthogonal polynomials of degree $p \in {2,3,...,15}$ with $\alpha \in {0,0.5,1}$ to emulate Ridge, Elastic Net, and LASSO models.
+
+```{r, echo=FALSE, fig.align= "center", fig.cap="APSE plots for various alpha values and polynomial degrees", fig.pos = "H"}
+set.seed(12)
+
+alpha_values = c(0, 0.5, 1)
+Log.Lambda.Seq = c(seq(-15, -0.5, by = 0.1), seq(0, 10, by = 0.1))
+Lambda.Seq = exp(Log.Lambda.Seq)
+
+APSE_df = data.frame(alpha = numeric(), degree = integer(), APSE = numeric())
+
+lamb_ridge = 10000
+lamb_elas = 10000
+lamb_lasso = 10000
+
+for (a in alpha_values) {
+  min_apse = 10000
+  for (deg in 2:15) {
+    X_train = as.matrix(train_data_df[2:(deg + 1)])
+    Y_train = train_data_df$Earnings
+    CV = cv.glmnet(x = X_train, y = Y_train, alpha = a, lambda = Lambda.Seq, nfolds = 10)
+    lambda_1se = CV$lambda.1se
+    model = glmnet(x = X_train, y = Y_train, alpha = a, lambda = lambda_1se)
+    predictions = predict(model, newx = as.matrix(test_data_df[, 2:(deg + 1)]))
+    APSE = mean((predictions - test_data_df$Earnings)^2)
+    if (APSE < min_apse) {
+      min_apse = APSE
+      if (a == 0){
+        lamb_ridge = lambda_1se
+      } else if (a == 0.5){
+        lamb_elas = lambda_1se
+      } else {
+        lamb_lasso = lambda_1se
+      }
+    }
+    APSE_df = rbind(APSE_df, data.frame(alpha = a, degree = deg, APSE = APSE))
+  }
+}
+
+par(mfrow = c(1, 3), mar = c(10, 2, 10, 2))
+plot(APSE_df$degree[APSE_df$alpha == alpha_values[1]], APSE_df$APSE[APSE_df$alpha == alpha_values[1]], 
+  type = "o", col = "blue", pch = 16, xlab = "Polynomial Degree", ylab = "APSE",
+  main = "APSE vs Polynomial Degree\n for Alpha = 0")
+
+plot(APSE_df$degree[APSE_df$alpha == alpha_values[2]], APSE_df$APSE[APSE_df$alpha == alpha_values[2]], 
+  type = "o", col = "blue", pch = 16, xlab = "Polynomial Degree", ylab = "APSE",
+  main = "APSE vs Polynomial Degree\n for Alpha = 0.5")
+
+plot(APSE_df$degree[APSE_df$alpha == alpha_values[3]], APSE_df$APSE[APSE_df$alpha == alpha_values[3]], 
+  type = "o", col = "blue", pch = 16, xlab = "Polynomial Degree", ylab = "APSE",
+  main = "APSE vs Polynomial Degree\n for Alpha = 1")
+```
+
+We notice from the results of Figure 9, for all $\alpha$ values, the lowest APSE value occurs when the polynomial degree $p=5$.
+
+```{r, echo=FALSE}
+set.seed(12)
+observed = test_data_df$Earnings
+X_train = as.matrix(train_data_df[, 2:6])
+Y_train = train_data_df$Earnings
+X_test = as.matrix(test_data_df[, 2:6])
+
+
+lambda_1se1 = lamb_ridge
+best_model_1 = glmnet(x = X_train, y = Y_train, alpha = 0, lambda = lambda_1se1)
+fitted_values1 = predict(best_model_1, newx = X_test)
+
+lambda_1se2 = lamb_elas
+best_model_2 = glmnet(x = X_train, y = Y_train, alpha = 0.5, lambda = lambda_1se2)
+fitted_values2 = predict(best_model_2, newx = X_test)
+
+lambda_1se3 = lamb_lasso
+best_model_3 = glmnet(x = X_train, y = Y_train, alpha = 1, lambda = lambda_1se3)
+fitted_values3 = predict(best_model_3, newx = X_test)
+
+
+APSE1 = mean((observed - fitted_values1)^2)
+APSE2 = mean((observed - fitted_values2)^2)
+APSE3 = mean((observed - fitted_values3)^2)
+
+table = data.frame(
+  Alpha = alpha_values,
+  APSE = c(APSE1,APSE2,APSE3)
+)
+```
+
+```{r, echo=FALSE}
+# nicely displaying the APSE values
+library(knitr)
+library(kableExtra)
+
+table %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Alpha Values and APSE Results",
+    digits = 4,
+    col.names = c("Alpha", "APSE"),
+    align = c("c", "c")
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center",
+    full_width = FALSE
+  )
+```
+Thus, from the results of Table 1, we can conclude that our best model is when alpha = 1 or the LASSO regression with polynomial degree 5.
+
+
+**APSE Analysis**
+```{r, echo=FALSE}
+model_APSEs = c(APSE_deg1, APSE_exp, APSE_dbl_exp, APSE3)
+model_types = c("Simple Linear Regression", "Exponential", "Double Exponential", "Elastic Net w/ alpha = 1")
+
+APSE_table = data.frame(
+  Model = model_types,
+  APSE = model_APSEs
+)
+
+APSE_table %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Intermediate APSE Results",
+    digits = 4,
+    col.names = c("Model", "APSE"),
+    align = c("c", "c")
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center",
+    full_width = FALSE
+  )
+```
+After summarizing all the APSE values we notice that the double exponential model has the best predicting power out of all the other models. Thus, we will select this model and make our predictions from here onward.
+
+
+## Residual Analysis
+In this section, we will perform the residual analysis for exponential smoothing, double exponential smoothing, and elastic net model with $\alpha = 1$ and polynomial degree $p = 5$. 
+
+Notice that in this section, out of elastic net and simple linear regression, we only perform residual analysis only on elastic linear regression. First, the two models are very similar conceptually and second, the APSE values for simple linear regression are really high, indicating poor performance even in comparison to other elastic net models.
+
+We will check the stationarity of the residuals and try to fit a Box-Jenkins model on them.
+
+
+```{r, echo=FALSE, fig.align= "center", fig.dim=c(7, 3), fig.cap="Residual analysis for exponential smoothing", fig.pos = "H"} 
+# Exponential Smoothing (Single)
+model_es <- HoltWinters(train, gamma = FALSE, beta = FALSE)
+
+# Fitted values for Exponential Smoothing
+es.train <- model_es$fitted[, "xhat"] 
+
+#  residuals for Exponential Smoothing
+residuals_exp <- train - es.train
+par(mfrow= c(1, 2), mar = c(5, 2, 5, 2))
+plot(
+  residuals_exp,
+  type = "l",
+  main = "Residuals from \nExponential Smoothing",
+  ylab = "Residuals",
+  xlab = "Time"
+)
+abline(h = 0, col = "red", lty = 2)
+
+acf(
+  residuals_exp,
+  main = "ACF of Residuals from \nExponential Smoothing",
+  xlab = "Lag",
+  ylab = "Autocorrelation"
+)
+
+# Caculating APSE 
+es.forecast <- predict(model_es, n.ahead = length(test))  # Forecast for the test set
+apse_es <- mean((test - es.forecast)^2)  # APSE for Single Exponential Smoothing
+```
+There does not seem to be any correlation in the acf plot. Additionally, a trend does not seem to exist in the variance plot. Hence, we can conclude stationarity for the residuals of exponential smoothing model.
+
+
+```{r, echo=FALSE, fig.align= "center", fig.dim=c(7, 3), fig.cap="Residual analysis for double exponential smoothing", fig.pos = "H"} 
+# Double Exponential Smoothing
+model_des <- HoltWinters(train, gamma = FALSE) # Includes trend (beta)
+
+des.train <- model_des$fitted[, "xhat"] 
+# Calculate residuals for Double Exponential Smoothing
+residuals_de <- train - des.train
+par(mfrow= c(1, 2), mar = c(5, 2, 5, 2))
+plot(
+  residuals_de,
+  type = "l",
+  main = "Residuals from \nDouble Exponential Smoothing",
+  ylab = "Residuals",
+  xlab = "Time"
+)
+abline(h = 0, col = "red", lty = 2)
+
+acf(
+  residuals_de,
+  main = "ACF of Residuals from \nDouble Exponential Smoothing",
+  xlab = "Lag",
+  ylab = "Autocorrelation"
+)
+```
+
+There does not seem to be any correlation in the acf plot. Additionally, a trend does not seem to exist in the variance plot. Hence, we can conclude stationarity for the residuals of double exponential smoothing model.
+
+
+```{r, echo=FALSE, fig.align= "center", out.width="80%", fig.cap="Residuals of the LASSO Model", fig.pos = "H"}
+
+train_fitted_values <- predict(best_model_3, newx = X_train)
+train_residuals <- Y_train - train_fitted_values
+
+#par(mfrow= c(1, 3), mar = c(5, 5, 4, 2))
+# Plot residuals over time 
+plot(
+  train_residuals,
+  type = "p",
+  main = "Residuals Over Time",
+  xlab = "Index",
+  ylab = "Residuals",
+  pch = 16,
+  col = "blue"
+)
+abline(h = 0, col = "red", lty = 2)
+
+```
+
+```{r, echo=FALSE, fig.align= "center", fig.dim=c(7, 3), fig.cap="ACF of LASSO model residuals", fig.pos = "H"}
+par(mfrow= c(1, 2), mar = c(5, 2, 5, 2))
+
+# ACF plot of residuals
+acf(
+  train_residuals,
+  main = "ACF of Residuals",
+  xlab = "Lag",
+  ylab = "Autocorrelation"
+) 
+# PACF plot of residuals
+pacf(
+  train_residuals,
+  main = "PACF of Residuals",
+  xlab = "Lag",
+  ylab = "Autocorrelation"
+)
+```
+
+The residual plot in Figure 12, seems to have a cyclic pattern. Additionally, we see a linear trend in the acf plot in Figure 13. Thus, we can conclude that these residuals are not stationary.
+
+The ACF plot shows a clear linear trend in the lag spikes. This suggests the presence of autocorrelation in the residuals, The PACF plot in Figure 14 shows a strong spike at lag 1 and no significant spikes afterward. This suggests a first-order autoregressive process (AR(1)).
+
+
+We will try ARIMA models with various p and q values and select the one with the best AIC value. Some of the ARIMA(p,d,q) we will try are: (1,0,1) (1,0,0) (0,0,1) (0,0,2) (1,0,2) (1, 0, 3) (1,0,9). Note again, since our is seasonally adjusted, we will be doing ARIMA and not SARIMA.
+
+```{r, echo=FALSE}
+# Fitting these models
+residuals_vec <- as.vector(train_residuals) 
+residuals_ts <- ts(residuals_vec)
+
+arima_101 <- arima(residuals_vec, order = c(1, 0, 1))
+arima_100 <- arima(residuals_vec, order = c(1, 0, 0))
+arima_001 <- arima(residuals_vec, order = c(0, 0, 1))
+arima_002 <- arima(residuals_vec, order = c(0, 0, 2))
+arima_102 <- arima(residuals_vec, order = c(1, 0, 2))
+arima_103 <- arima(residuals_vec, order = c(1, 0, 3))
+arima_109 <- arima(residuals_vec, order = c(1, 0, 9))
+
+aic_values <- data.frame(
+  Model = c("ARIMA(1,0,1)", "ARIMA(1,0,0)", "ARIMA(0,0,1)", 
+            "ARIMA(0,0,2)", "ARIMA(1,0,2)", "ARIMA(1,0,3)", "ARIMA(1,0,9)"),
+  AIC = c(AIC(arima_101), AIC(arima_100), AIC(arima_001), 
+          AIC(arima_002), AIC(arima_102), AIC(arima_103), AIC(arima_109))
+)
+
+aic_values %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "AIC of Different ARIMA Models",
+    digits = 4,
+    col.names = c("Model", "AIC"),
+    align = c("c", "c")
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center",
+    full_width = FALSE
+  )
+
+```
+
+As we see the lowest AIC value occurs for ARIMA(1,0,2). Now, we will fit this ARIMA model on the residuals of the Elastic Net Model.
+
+```{r, echo=FALSE, fig.align= "center", fig.dim=c(7, 3),fig.cap="Residual analysis for ARIMA(1,0,2) Model", fig.pos = "H"} 
+best_bj_model <- arima_102  # ARIMA(1,0,2)
+
+best_bj_model_residuals <- residuals(best_bj_model)
+par(mfrow= c(1, 2), mar = c(5, 2, 5, 2))
+
+ts.plot(best_bj_model_residuals, main = "Residuals for\nARIMA(1,0,2) Model", ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+
+acf(best_bj_model_residuals, main = "ACF of Residuals for\nARIMA(1,0,2) Model")
+```
+
+Now, after the applying the ARIMA model, we see that the residuals are indeed stationary as they seem to be randomly scattered and the spikes in the acf plot do not seem to be correlated.
+
+Next, we generate predictions for residuals of the test set using the ARIMA 
+process and add the trend component back to get forecasted values for the test set
+indices. Then we will extract the new APSE for the Elastic Net model.
+
+```{r, echo=FALSE}
+lasso_predictions <- predict(best_model_3, newx = X_test)  
+
+arima_forecast <- predict(best_bj_model, n.ahead = nrow(X_test))  # ARIMA(1,0,2) forecasts
+arima_pred =  arima_forecast$pred
+
+final_forecast <- lasso_predictions + arima_pred  # Combine lasso and ARIMA
+observed_test <- test_data_df$Earnings  # Actual test set values
+
+final_forecast_vec = as.vector(final_forecast)
+observed_test_vec = as.vector(observed_test)
+
+apse_forecast <- mean((observed_test_vec - final_forecast_vec)^2)  
+```
+
+```{r, echo=FALSE}
+model_APSEs = c(APSE_deg1, APSE_exp, APSE_dbl_exp, apse_forecast)
+model_types = c("Simple Linear Regression", "Exponential", "Double Exponential", "Elastic Net w/ alpha = 1 and ARIMA")
+
+APSE_table = data.frame(
+  Model = model_types,
+  APSE = model_APSEs
+)
+
+APSE_table %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Final APSE Results",
+    digits = 4,
+    col.names = c("Model", "APSE"),
+    align = c("c", "c")
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center",
+    full_width = FALSE
+  )
+```
+
+The new APSE value for the Elastic Net Regression after applying ARIMA(1,0,2) is approximately $28.261$. This is a significant improvement from our previous APSE, however, the APSE value of our double-exponential model is still better.
+
+
+## Prediction
+
+Recall that in one of the earlier sections we removed a portion of the data that contained the change point. Since we are interested in predicting the the median earnings for year 2025, we will predict it using the data with the change point removed which will lead to a gap of 1 year on the plot. 
+
+```{r, echo=FALSE, fig.align= "center", out.width="80%", fig.cap="Prediction for the Next Year with Prediction Intervals", fig.pos = "H"}
+plot(data, main = "Median weekly earnings",
+     ylab = "Median weekly earnings", 
+     xlim = c(1979, 2027), 
+     ylim = c(305,410),
+     col = "blue", type = "p")
+legend('topleft', legend=c("Training set", "Fit", 
+                          "Year-ahead prediction",
+                          "95% Prediction Interval"), 
+       col=c("blue", "orange", "red", "red"), 
+       lty=c(NA, NA, 1, 2), pch = c(1, 1, NA, NA), cex=1)
+model = HoltWinters(data, beta = TRUE, gamma = FALSE) 
+es.train = model$fitted
+HW.predict = predict(model, n.ahead=4 , prediction.interval = TRUE , level=0.95)
+lines(ts(start = 1979 + 2/4, es.train[,"xhat"], frequency = 4), 
+      col = adjustcolor('orange', 0.7), lwd = 2)
+lines(ts(start = 2025 + 1/4, HW.predict[,"fit"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 2)
+
+lines(ts(start = 2025 + 1/4, HW.predict[,"upr"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 1, lty = 2)
+lines(ts(start = 2025 + 1/4, HW.predict[,"lwr"], frequency = 4), 
+      col = adjustcolor('red', 0.7), lwd = 1, lty = 2)
+
+predict_table = data.frame(
+  Time = c("2024 Q4","2025 Q1","2025 Q2","2025 Q3"),
+  Prediction = HW.predict[,"fit"]
+)
+
+predict_table %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Prediction for Next Year",
+    digits = 4,
+    col.names = c("Time", "Prediction Values"),
+    align = c("c", "c")
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    position = "center",
+    full_width = FALSE
+  )
+```
+
+Overall, although the prediction for next year seems to follow the increasing trend of the data, however, our prediction bands are very wide. The reason for this wide interval could be due to the changing variance throughout out dataset which we were not able to address through the Box-Cox transformation. Additionally, the change of data collection process might have had a more significant impact than we had anticipated. As a result of this disturbance in our data, our model is not very confident about its predictions.
+
+## Conclusions
+
+In this report we investigated the earnings dataset. There were a few issues that were identified with the original data, but only some of them could be addressed
+
+- We removed the change point due to Covid-19
+- We did not think that the change point due to changes in data collection affected the data so we did not address that
+- The change in variance could not be addressed
+
+After addressing all issues with the data, we went to investigate several models that we found to be appropriate for this dataset. Specifically, we focused on
+
+- Simple linear regression
+- Exponential smoothing
+- Double Exponential Smoothing
+- Elastic Net Regression
+
+which were compared based on their prediction power. 
+
+However, after performing residual analysis we noticed that Elastic Net Regression leaves out correlated reiduals. Hence, it was decided to add an ARIMA model to the residuals of the chosen elastic net model. After that, the residuals for all models were uncorrelated so we could focus on making predictions for the whole dataset.
+
+From the APSE analysis of all 4 models, we found that double exponential smoothing performed the best in terms of prediction. We used that model to perform prediction on the whole dataset (ommitting the Covid-19 change point). 
+
+Lastly, after predicting the median earnings for the year 2025 we noticed that the prediction intervals were very wide. This means that one of the issues that we didn't consider at the start. For example, the change point due to changes in the data collection process might have had more impact on the final result than anticipated. 
+
+Overall, while we were able to achieve stationary residuals for all models, we were not able to create a model that has high confidence in its predictions. 
