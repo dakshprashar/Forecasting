@@ -48,7 +48,7 @@ As a note: the data does not contain any missing values so we did not have to ad
 
 
 ```{r, echo=FALSE}
-original_data <- ts(read.csv("LES1252881600Q.csv")["LES1252881600Q"], start = 1979, frequency = 4)
+original_data <- ts(read.csv("dataset.csv")["LES1252881600Q"], start = 1979, frequency = 4)
 ```
 
 ## Exploratory data analysis 
